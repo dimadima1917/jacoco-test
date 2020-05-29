@@ -1,0 +1,262 @@
+throttle(['one-per-node-throttle']) {
+    node('TCB && !(linux-lwpejenkins-a4)') {
+        properties([
+                parameters([
+                        string(name: 'DOCKER_COMPOSE_BRANCH', defaultValue: 'master', description: ''),
+                        string(name: 'SOURCE_CODE_BRANCH', defaultValue: 'master', description: ''),
+                        string(name: 'TEST_CODE_BRANCH_V1', defaultValue: 'master', description: ''),
+                        booleanParam(name: 'RUN_WITH_SPINNAKER_MOCK', defaultValue: true,
+                                description: 'Running tests with Spinnaker mock')
+                ])
+        ])
+
+        timestamps {
+            JAVA_VM_OPTIONS = "--add-opens java.base/jdk.internal.reflect=ALL-UNNAMED " +
+                    "--add-opens java.base/jdk.internal.loader=ALL-UNNAMED " +
+                    "--add-opens java.base/jdk.internal.module=ALL-UNNAMED  " +
+                    "--add-opens java.base/java.lang.module=ALL-UNNAMED " +
+                    "-Dspring.profiles.active=test"
+            JAVA_PATH = "/usr/lib/java-1.11.0-28"
+            EUREKA_PARAM = "-Deureka.instance.metadataMap.zone=smokejob"
+
+            def servicePorts = [8280, 8880, 8780, 8980, 8685] as int[]
+            def services = [
+                    'beacon-equipment-service/',
+                    'beacon-oe3-service/',
+                    'beacon-tug-endpoints-service/',
+                    'beacon-ems-service/beacon-ems-component/'
+            ] as String[]
+
+            try {
+                stage('1. Pulling Code') {
+                    deleteDir()
+                    dropContainers()
+                    downloadAllDependencies()
+                }
+
+                stage('2. Building') {
+                    timeout(time: 10, unit: 'MINUTES') {
+                        printStepName("BUILDING THE BEACON SERVER")
+                        dir('source-code') {
+                            withEnv(["JAVA_HOME=${JAVA_PATH}"]) {
+                                sh 'mvn -q clean -U install -DskipTests=true'
+                            }
+                        }
+                    }
+                }
+
+                stage('3. Starting Services') {
+                    timeout(time: 10, unit: 'MINUTES') {
+                        withEnv(["JAVA_HOME=${JAVA_PATH}"]) {
+                            freeServicePorts(servicePorts)
+                            startServices(services, servicePorts)
+                        }
+                    }
+                }
+
+                stage('4. Running Tests') {
+                    timeout(time: 240, unit: 'MINUTES') {
+                        printStepName("RUNNING THE BEACON QA TESTS")
+                        dir('test') {
+                            withEnv(["JAVA_HOME=$JAVA_PATH"]) {
+                                sh script: printWithNoTrace("mvn clean -Dtestsuite=oe3su install " +
+                                        "-Duse-spinnaker-mock=${params.RUN_WITH_SPINNAKER_MOCK} " +
+                                        "$EUREKA_PARAM " +
+                                        "--log-file tcb-qa-tests.log")
+                            }
+                        }
+                        currentBuild.result = "SUCCESS"
+                    }
+
+                }
+            } catch (e) {
+                currentBuild.result = "FAILED"
+                printStepName("ERROR HAS OCCURRED: " + e.toString())
+                printTestsLog('test', 'tcb-qa-tests.log')
+                collectLogsFromServices()
+                collectTestsLog()
+                throw e
+            } finally {
+                step([$class: 'Publisher', reportFilenamePattern: '**/testng-results.xml'])
+                printStepName("CLEANING UP WORK SPACE AFTER JOB")
+                freeServicePorts(servicePorts)
+                clearWorkspace()
+            }
+        }
+    }
+}
+
+def clearWorkspace() {
+    def out = sh script: printWithNoTrace("sudo netstat -tulpn | grep 9092"), returnStatus: true
+    if (out == 0) {
+        removeAllContainersWithVolumes()
+    }
+    deleteDir()
+}
+
+def freeServicePorts(int[] ports) {
+    echo("---TERMINATING PROCESSES ON BEACON SERVER PORTS---")
+    for (int i = 0; i < ports.length; i++) {
+        sh printWithNoTrace("sudo fuser -k ${ports[i]}/tcp || true")
+    }
+    echo "All PORTS ARE FREE"
+}
+
+def startServices(String[] services, int[] ports) {
+    printStepName("STARTING BEACON SERVICES")
+    for (int i = 0; i < services.length; i++) {
+        def jarFile = null
+        def target = "source-code/" + services[i] + "target/"
+        dir(target) {
+            jarFile = sh(script: "ls *.jar", returnStdout: true).trim()
+        }
+        sh "${JAVA_PATH}/bin/java -jar  $EUREKA_PARAM -Xmx1536m $JAVA_VM_OPTIONS ${target}${jarFile} &"
+        checkIfServiceIsUp(ports[i])
+    }
+}
+
+def dropContainers() {
+    echo "--DROP DOCKER CONTAINERS IF EXISTS--"
+    sh script: "docker ps -a"
+    sh printWithNoTrace("docker ps -a | awk '{ print \$1, \$2}' | grep '..tcb/infra..' | awk '{print \$1 }' | xargs -I{} docker rm -fv {}")
+    echo "--TCB DOCKER CONTAINERS SHOULD BE DELETED. CHECKING:--"
+    sh script: "docker ps -a"
+}
+
+def removeAllContainersWithVolumes() {
+    echo "--STOPPING DOCKER COMPOSE--"
+    dir('compose') {
+        timeout(time: 5, unit: 'MINUTES') {
+            waitUntil {
+                script {
+                    def out = sh script: printWithNoTrace("docker-compose --no-ansi -f docker-compose-infra-smoke-test-job.yml down --remove-orphans"),
+                            returnStatus: true
+                    return (out == 0)
+                }
+            }
+        }
+        echo "--DOCKER WAS STOPPED--"
+        echo "--REMOVING DOCKER CONTAINERS AND IMAGES--"
+        timeout(time: 10, unit: 'MINUTES') {
+            waitUntil {
+                script {
+                    def out = sh script: printWithNoTrace("docker system prune --all --force --volumes"),
+                            returnStatus: true
+                    return (out == 0)
+                }
+            }
+        }
+        echo "--CONTAINERS VOLUMES WERE REMOVED--"
+    }
+}
+
+def downloadAllDependencies() {
+    printStepName("DOWNLOADING BEACON SERVER REPOSITORY")
+    dir('source-code') {
+        git(
+                url: 'ssh://git@bitbucket.tideworks.com:7999/tcb/tcb-beacon-server.git',
+                credentialsId: '9f15dc89-7622-4f24-8362-6e5e1f683b5d',
+                branch: "${params.SOURCE_CODE_BRANCH}",
+                returnStdOut: true
+        )
+    }
+    dir('test') {
+        printStepName("DOWNLOADING BEACON QA TESTS REPOSITORY")
+        git(
+                url: 'ssh://git@bitbucket.tideworks.com:7999/tcb/beacon-qa-tests.git',
+                credentialsId: '9f15dc89-7622-4f24-8362-6e5e1f683b5d',
+                branch: "${params.TEST_CODE_BRANCH_V1}",
+                returnStdOut: true
+        )
+    }
+    dir('compose') {
+        printStepName("DOWNLOADING DOCKER REPOSITORY")
+        git(
+                url: 'ssh://git@bitbucket.tideworks.com:7999/tcb/tcb-docker-files.git',
+                credentialsId: '9f15dc89-7622-4f24-8362-6e5e1f683b5d',
+                branch: "${params.DOCKER_COMPOSE_BRANCH}",
+                returnStdOut: true)
+        pullDockerContainers()
+    }
+}
+
+def checkIfServiceIsUp(Integer port) {
+    echo "--CHECKING IF THE BEACON SERVICE ON THE PORT ${port} IS UP--"
+    timeout(time: 5, unit: 'MINUTES') {
+        waitUntil {
+            sh printWithNoTrace("sleep 15")
+            script {
+                def out = sh script: printWithNoTrace("sudo netstat -tulpn | grep ${port}"), returnStatus: true
+                return (out == 0)
+            }
+        }
+    }
+}
+
+def pullDockerContainers() {
+    printStepName("PULLING DOCKER CONTAINERS")
+    timeout(time: 8, unit: 'MINUTES') {
+        waitUntil {
+            script {
+                def out = sh script: printWithNoTrace("docker-compose -f docker-compose-infra-smoke-test-job.yml pull"),
+                        returnStatus: true
+                return (out == 0)
+            }
+        }
+    }
+
+    echo "--STARTING DOCKER CONTAINERS--"
+    timeout(time: 8, unit: 'MINUTES') {
+        waitUntil {
+            script {
+                def out = sh script: printWithNoTrace("docker-compose -f docker-compose-infra-smoke-test-job.yml up -d"),
+                        returnStatus: true
+                return (out == 0)
+            }
+        }
+    }
+    sh printWithNoTrace("docker container ps")
+}
+
+def printWithNoTrace(cmd) {
+    return "#!/bin/sh -e\n" + cmd + " > /dev/null"
+}
+
+def printStepName(stepToPrint) {
+    echo("""#########################################################################
+# ${stepToPrint}
+#########################################################################""")
+}
+
+def collectLogsFromServices() {
+    printStepName("COLLECTING LOGS FROM THE SERVICES")
+    sh "cp -fR logs services_logs ; zip -9 -rq services_logs.zip services_logs"
+    archiveArtifacts artifacts: '*.zip'
+}
+
+def collectTestsLog() {
+    sh "zip -9 -rq test_logs.zip test/tcb-qa-tests.log"
+    archiveArtifacts '*.zip'
+}
+
+def createAllureReport() {
+    script {
+        allure([
+                includeProperties: false,
+                jdk              : '',
+                properties       : [],
+                reportBuildPolicy: 'ALWAYS',
+                results          : [[path: '**/target/allure-results']]
+        ])
+    }
+}
+
+def printTestsLog(workDir, logName) {
+    dir("${workDir}") {
+        if (fileExists(logName)) {
+            sh script: "tail -200 ${logName}"  
+        } else {
+            sh script: "echo WARNING: File ${logName} doesn't exist"  
+        }  
+    }  
+}
